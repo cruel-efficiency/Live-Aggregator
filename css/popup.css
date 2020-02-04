@@ -134,6 +134,7 @@ input {
   padding: 3px 6px;
   font-size: 12px;
   font-weight: 600;
+  max-width: 110px;
   color: black;
 }
 
