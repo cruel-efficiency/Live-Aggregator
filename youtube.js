@@ -61,17 +61,22 @@ const fetchLiveWatchPageData = url => {
     .then(response => {
       let fake_html = document.createElement('html');
       fake_html.innerHTML = response;
-
       let watch_page_data = {};
-      let title_elements = fake_html.getElementsByTagName('title');
-      for (i = 0; i < title_elements.length; i++) {
-        if (title_elements[i].text != 'YouTube') {
-          watch_page_data.title = title_elements[i].text;
-        }
-      }
       let scripts = fake_html.getElementsByTagName('script');
       Array.prototype.slice.call(scripts).forEach(script => {
         let script_str = script.innerHTML;
+        if (script_str.includes('window["ytInitialPlayerResponse"] = ')) {
+          let title_matches = script_str.match(
+              new RegExp('window\\[\\"ytInitialPlayerResponse\\"\\] = ({.*});'));
+          if (title_matches.length >= 2) {
+            let player_data = JSON.parse(title_matches[1]);
+            if (player_data.videoDetails) {
+              watch_page_data.title = player_data.videoDetails.title;
+            }
+          } else {
+            console.err("Can't find ytIntiialPlayerResponse data.");
+          }
+        }
         if (script_str.includes('watching now')) {
           let viewers_matches = script_str.match(
               new RegExp('([\\d,]+)\ watching\ now'));
