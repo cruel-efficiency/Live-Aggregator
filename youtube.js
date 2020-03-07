@@ -4,50 +4,46 @@ import { getCookie, makeRestRequest, Platform } from './util.js';
 
 var i;
 
-// Scrapes auth data from the user's youtube to make the request.
-const fetchYtcfg = () => {
-  return new Promise((resolve, reject) => {
-    makeRestRequest({
-      method: 'GET',
-      url: 'https://www.youtube.com',
-      headers: {}
-    })
-    .then((response) => {
-      var fake_html = document.createElement('html');
-      fake_html.innerHTML = response;
-      let scripts = fake_html.getElementsByTagName('script')
-      Array.prototype.slice.call(scripts).forEach(script => {
-        let script_str = script.innerHTML;
-        if (script_str.includes('XSRF_TOKEN')) {
-          let xsrf_matches = script_str.match(
-              new RegExp('"XSRF_TOKEN":"([a-zA-Z0-9]+=)"'));
-          let client_matches = script_str.match(
-              new RegExp('"INNERTUBE_CONTEXT_CLIENT_VERSION":"([\\d.]+)"'));
-          if (xsrf_matches.length == 2 && client_matches.length == 2) {
-            resolve({
-              XSRF_TOKEN: xsrf_matches[1],
-              INNERTUBE_CONTEXT_CLIENT_VERSION: client_matches[1]
-            });
-          }
-        }
-      });
-      reject('Couldn\'t fetch YouTube ytcfg.');
-    })
-    .catch(reject);
-  });
+// Takes an http response, converts it into HTML, and runs *scan_func* every
+// time a script tag is encountered.
+const forEachScript = (html_response, scan_func) => {
+  let fake_html = document.createElement('html');
+  fake_html.innerHTML = html_response;
+  let scripts = fake_html.getElementsByTagName('script');
+  Array.prototype.slice.call(scripts).some(scan_func);
 };
 
-const fetchFollowedChannels = ytcfg => {
+// Given a script tag, try to extract a particular dict that YouTube neatly
+// stores a lot of page data in.
+const findYtDict = (script_tag, sanity_str, regex_str) => {
+  let script_str = script_tag.innerHTML;
+  if (script_str.includes(sanity_str)) {
+    console.log(sanity_str);
+    let matches = script_str.match(
+        new RegExp(regex_str));
+    if (matches && matches.length >= 2) {
+      return JSON.parse(matches[1]);
+    } else {
+      console.error('Can\'t regex yt dict, sanity str: ' + sanity_str);
+    }
+  }
+};
+
+const findWatchPageDict = script_tag => {
+  return findYtDict(script_tag, 'window["ytInitialPlayerResponse"] = ',
+    'window\\[\\"ytInitialPlayerResponse\\"\\] = ({.*});');
+};
+
+const findHomePageDict = script_tag => {
+  return findYtDict(script_tag, 'ytInitialGuideData = ',
+    'ytInitialGuideData = ({.*});');
+};
+
+const fetchYtHome = () => {
   return makeRestRequest({
     method: 'GET',
-    url:
-      'https://www.youtube.com/guide_ajax?action_load_guide=1',
-    headers: {
-      'x-youtube-client-name': '1',
-      'x-youtube-identity-token': ytcfg.XSRF_TOKEN,
-      'x-youtube-client-version': ytcfg.INNERTUBE_CONTEXT_CLIENT_VERSION
-    },
-    json: true
+    url: 'https://www.youtube.com',
+    headers: {}
   });
 };
 
@@ -59,24 +55,23 @@ const fetchLiveWatchPageData = url => {
       url: url
     })
     .then(response => {
-      let fake_html = document.createElement('html');
-      fake_html.innerHTML = response;
       let watch_page_data = {};
-      let scripts = fake_html.getElementsByTagName('script');
-      Array.prototype.slice.call(scripts).forEach(script => {
-        let script_str = script.innerHTML;
-        if (script_str.includes('window["ytInitialPlayerResponse"] = ')) {
-          let title_matches = script_str.match(
-              new RegExp('window\\[\\"ytInitialPlayerResponse\\"\\] = ({.*});'));
-          if (title_matches.length >= 2) {
-            let player_data = JSON.parse(title_matches[1]);
-            if (player_data.videoDetails) {
-              watch_page_data.title = player_data.videoDetails.title;
-            }
+      forEachScript(response, script => {
+        // Scrape stream title.
+        let yt_dict = findWatchPageDict(script);
+        if (yt_dict) {
+          if (yt_dict.videoDetails) {
+            watch_page_data.title = yt_dict.videoDetails.title;
           } else {
-            console.err("Can't find ytIntiialPlayerResponse data.");
+            console.error("Can't regex ytInitialPlayerResponse data.");
           }
+          return true; // break
         }
+      });
+
+      forEachScript(response, script => {
+        // Scrape live viewer count.
+        let script_str = script.innerHTML;
         if (script_str.includes('watching now')) {
           let viewers_matches = script_str.match(
               new RegExp('([\\d,]+)\ watching\ now'));
@@ -84,6 +79,7 @@ const fetchLiveWatchPageData = url => {
             watch_page_data.view_count = parseInt(
                 viewers_matches[1].replace(',', ''));
             resolve(watch_page_data);
+            return true; // break
           } else {
             reject(`Failed to regex view count for ${url}`);
           }
@@ -125,51 +121,56 @@ class YoutubeFetcher {
     // The last retrieved streamer objects fetched. If there was a failure,
     // return [].
     this.streamer_objs = [];
-
-    // Necessary to make authenticated requests.
-    this._cached_ytcfg = {};
   }
 
   fetchStreamerObjs() {
     return new Promise((resolve, reject) => {
-      this._getYtcfg()
-        .then(fetchFollowedChannels)
-        .then(follower_response => {
+      fetchYtHome()
+        .then(response => {
           let new_streamer_objs = [];
           let found_subs = false;
-          follower_response.response.items.forEach(item => {
-            let is_logged_in_but_no_subs_marker = item.guideSectionRenderer;
-            if (is_logged_in_but_no_subs_marker &&
-                is_logged_in_but_no_subs_marker.title == 'Subscriptions') {
-              found_subs = true;
-            }
-
-            let subs = item.guideSubscriptionsSectionRenderer;
-            if (subs) {
-              subs.items.forEach(item => {
-                let guideEntry = item.guideEntryRenderer;
-                if (guideEntry) {
+          forEachScript(response, script => {
+            let yt_dict = findHomePageDict(script);
+            if (yt_dict) {
+              yt_dict.items.some(item => {
+                let is_logged_in_but_no_subs_marker = item.guideSectionRenderer;
+                if (is_logged_in_but_no_subs_marker &&
+                    is_logged_in_but_no_subs_marker.title == 'Subscriptions') {
                   found_subs = true;
-                  let streamer_obj = buildStreamerObj(guideEntry);
-                  if (streamer_obj) {
-                    new_streamer_objs.push(streamer_obj);
-                  }
                 }
-  
-                // Followed channels under 'Show More'.
-                let hidden_subs = item.guideCollapsibleEntryRenderer;
-                if (hidden_subs) {
-                  hidden_subs.expandableItems.forEach(item => {
+
+                let subs = item.guideSubscriptionsSectionRenderer;
+                if (subs) {
+                  subs.items.forEach(item => {
                     let guideEntry = item.guideEntryRenderer;
                     if (guideEntry) {
+                      found_subs = true;
                       let streamer_obj = buildStreamerObj(guideEntry);
                       if (streamer_obj) {
                         new_streamer_objs.push(streamer_obj);
                       }
                     }
+
+                    // Followed channels under 'Show More'.
+                    let hidden_subs = item.guideCollapsibleEntryRenderer;
+                    if (hidden_subs) {
+                      hidden_subs.expandableItems.forEach(item => {
+                        let guideEntry = item.guideEntryRenderer;
+                        if (guideEntry) {
+                          let streamer_obj = buildStreamerObj(guideEntry);
+                          if (streamer_obj) {
+                            new_streamer_objs.push(streamer_obj);
+                          }
+                        }
+                      });
+                    }
                   });
+                  return true; // break
                 }
               });
+            }
+            if (found_subs) {
+              return true; // break;
             }
           });
           if (found_subs) {
@@ -200,35 +201,10 @@ class YoutubeFetcher {
           console.log('Unable to reach YouTube: ', error);
           this.status = false;
           this.streamer_objs = [];
-          // Dump ytcfg incase it is responsible.
-          this._cached_ytcfg = {};
           resolve(this.streamer_objs);
         });
     });
   }
-
-  // If cached, return the cached YTCFG. Otherwise, fetch a new one and update
-  // __cached_ytcfg.
-  _getYtcfg() {
-    return new Promise((resolve, reject) => {
-      if (isYtcfgValid(this._cached_ytcfg)) {
-        resolve(this._cached_ytcfg);
-      } else {
-        fetchYtcfg()
-          .then(ytcfg => {
-            if (isYtcfgValid(ytcfg)) {
-              this._cached_ytcfg = ytcfg;
-              resolve(this._cached_ytcfg);
-            } else {
-              // If its still broken, fail.
-              reject('Unable to build ytcfg.');
-            }
-          })
-          .catch(reject);
-      }
-    });
-  }
 }
-
 
 export {YoutubeFetcher};
