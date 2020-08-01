@@ -1,6 +1,6 @@
 'use strict';
 
-const LIVE_ENTRY_CLASS = '.side-nav-section .tw-relative.tw-transition-group';
+const LIVE_ENTRY_CLASS = '.side-nav-section .tw-relative.tw-transition-group div[aria-label="Followed Channels"]';
 
 // Dynamic imports because content_scripts suck.
 var GetStreamerObjs;
